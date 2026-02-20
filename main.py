@@ -4,6 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import psycopg2
 import requests
+import bcrypt
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -18,7 +19,12 @@ MELI_CLIENT_ID = os.environ.get("MELI_CLIENT_ID")
 MELI_CLIENT_SECRET = os.environ.get("MELI_CLIENT_SECRET")
 MELI_REDIRECT_URI = os.environ.get("MELI_REDIRECT_URI")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt"], 
+    deprecated="auto", 
+    bcrypt__handle_long_passwords=True
+)
+
 SECRET_KEY = os.environ.get("SECRET_KEY", "MARROKING_SECRET_2024")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
@@ -153,6 +159,8 @@ def sync_meli_products(user=Depends(get_current_user)):
     try:
         conn = get_connection()
         cur = conn.cursor()
+
+        cur.execute("DELETE FROM products")
 
         # Obtener credenciales
         cur.execute("SELECT value FROM credentials WHERE key='access_token'")
@@ -323,13 +331,27 @@ def login(username: str = Body(...), password: str = Body(...)):
     user = cur.fetchone()
     conn.close()
 
-    if not user or not pwd_context.verify(password, user["password"]):
+    if not user:
         raise HTTPException(status_code=400, detail="Credenciales inválidas")
+
+    # --- CAMBIO CLAVE: VERIFICACIÓN DIRECTA ---
+    try:
+        # Convertimos la contraseña y el hash a bytes para bcrypt
+        password_bytes = password.encode('utf-8')
+        hashed_password = user["password"].encode('utf-8')
+
+        if not bcrypt.checkpw(password_bytes, hashed_password):
+            raise HTTPException(status_code=400, detail="Credenciales inválidas")
+    except Exception as e:
+        print(f"Error en validación bcrypt: {e}")
+        # Si algo falla con bcrypt, intentamos el método viejo por si acaso
+        if not pwd_context.verify(password, user["password"]):
+            raise HTTPException(status_code=400, detail="Credenciales inválidas")
+    # ------------------------------------------
 
     token = create_access_token({
         "sub": user["username"],
         "role": user["role"]
     })
-
+    
     return {"access_token": token, "token_type": "bearer"}
-    # cambio prueba
