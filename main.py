@@ -150,7 +150,7 @@ async def meli_callback(code: str = None):
     return {"status": "error", "detail": data}
 
 # =====================================================
-# SINCRONIZAR PRODUCTOS (CORREGIDO Y FILTRADO)
+# SINCRONIZAR PRODUCTOS (ACTUALIZACIÓN REAL DE STOCK)
 # =====================================================
 @app.post("/meli/sync")
 def sync_meli_products(user=Depends(get_current_user)):
@@ -159,7 +159,6 @@ def sync_meli_products(user=Depends(get_current_user)):
         conn = get_connection()
         cur = conn.cursor()
 
-        # 1. Obtener credenciales (con manejo de error si es diccionario o tupla)
         cur.execute("SELECT value FROM credentials WHERE key='access_token'")
         token_row = cur.fetchone()
         cur.execute("SELECT value FROM credentials WHERE key='user_id'")
@@ -168,20 +167,20 @@ def sync_meli_products(user=Depends(get_current_user)):
         if not token_row or not user_row:
             raise HTTPException(status_code=400, detail="Mercado Libre no vinculado")
 
-        # Aseguramos extraer el valor correctamente sea RealDictCursor o no
-        token = token_row["value"] if isinstance(token_row, dict) else token_row[0]
-        user_id = user_row["value"] if isinstance(user_row, dict) else user_row[0]
+        token = token_row["value"]
+        user_id = user_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 2. Obtener IDs de todos los productos (Activos, Pausados, etc.)
+        # 1. Obtener IDs (Agregamos params para evitar caché)
         items_ids = []
         url_search = f"https://api.mercadolibre.com/users/{user_id}/items/search"
-        params = {"search_type": "scan", "limit": 100}
+        # Traemos todos los estados posibles para no dejar ninguno fuera
+        params = {"search_type": "scan", "limit": 100, "status": "active,paused,not_yet_active"}
         
         r_search = requests.get(url_search, headers=headers, params=params)
         data_search = r_search.json()
-        scroll_id = data_search.get("scroll_id")
         items_ids.extend(data_search.get("results", []))
+        scroll_id = data_search.get("scroll_id")
 
         while scroll_id:
             r_scroll = requests.get(url_search, headers=headers, params={"search_type": "scan", "scroll_id": scroll_id})
@@ -192,48 +191,50 @@ def sync_meli_products(user=Depends(get_current_user)):
             scroll_id = d_scroll.get("scroll_id")
 
         if items_ids:
-            # LIMPIEZA JUSTO ANTES DE INSERTAR PARA EVITAR ERRORES
+            # LIMPIEZA PARA RECONSTRUIR DESDE CERO
             cur.execute("DELETE FROM products")
             count = 0
 
             for m_id in items_ids:
-                # Consultamos el detalle real de cada producto para ver su estatus actual
-                detail_resp = requests.get(f"https://api.mercadolibre.com/items/{m_id}", headers=headers)
+                # TRUCO: Agregamos un timestamp aleatorio para forzar a MELI a darnos el dato real actual
+                ts = int(datetime.utcnow().timestamp())
+                detail_resp = requests.get(f"https://api.mercadolibre.com/items/{m_id}?ts={ts}", headers=headers)
                 if detail_resp.status_code != 200: continue
                 item = detail_resp.json()
 
-                # CAPTURAMOS EL STATUS REAL: 'active', 'paused', 'closed', etc.
-                status_real = item.get("status", "active") 
+                status_real = item.get("status", "active")
+                # El precio global
                 price = item.get("price") or 0
 
                 if item.get("variations"):
                     for var in item["variations"]:
+                        # IMPORTANTE: El stock de la secadora vendida está AQUÍ dentro
+                        stock_var = var.get("available_quantity", 0)
                         attrs = " - ".join([a["value_name"] for a in var.get("attribute_combinations", [])])
-                        name = f"{item['title']} ({attrs})"
-                        stock = var.get("available_quantity") or 0
+                        name_var = f"{item['title']} ({attrs})"
                         meli_var_id = f"{m_id}-{var['id']}"
                         
                         cur.execute("""
                             INSERT INTO products (name, price, stock, meli_id, status)
                             VALUES (%s, %s, %s, %s, %s)
-                        """, (name, price, stock, meli_var_id, status_real))
+                        """, (name_var, price, stock_var, meli_var_id, status_real))
                         count += 1
                 else:
-                    stock = item.get("available_quantity") or 0
+                    # Si no tiene variaciones, el stock es el global
+                    stock_global = item.get("available_quantity", 0)
                     cur.execute("""
                         INSERT INTO products (name, price, stock, meli_id, status)
                         VALUES (%s, %s, %s, %s, %s)
-                    """, (item["title"], price, stock, m_id, status_real))
+                    """, (item["title"], price, stock_global, m_id, status_real))
                     count += 1
 
             conn.commit()
             return {"status": "success", "sincronizados": count}
         
-        return {"status": "success", "message": "No se encontraron productos"}
+        return {"status": "success", "message": "No hay productos"}
 
     except Exception as e:
         if conn: conn.rollback()
-        print(f"ERROR EN SYNC: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
