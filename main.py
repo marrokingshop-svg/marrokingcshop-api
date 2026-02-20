@@ -20,9 +20,8 @@ MELI_CLIENT_SECRET = os.environ.get("MELI_CLIENT_SECRET")
 MELI_REDIRECT_URI = os.environ.get("MELI_REDIRECT_URI")
 
 pwd_context = CryptContext(
-    schemes=["bcrypt"], 
-    deprecated="auto", 
-    bcrypt__handle_long_passwords=True
+    schemes=["bcrypt"],
+    deprecated="auto"
 )
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "MARROKING_SECRET_2024")
