@@ -281,7 +281,7 @@ def get_products_grouped():
     return {"products": products}
 
 # =====================================================
-# ACTUALIZAR STOCK EN MERCADO LIBRE
+# ACTUALIZAR STOCK EN MERCADO LIBRE (VERSIÓN FINAL)
 # =====================================================
 class StockUpdate(BaseModel):
     new_stock: int
@@ -301,20 +301,22 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         
         token = token_row["value"]
         
-        # Agregamos "Accept" para que MELI nos responda con detalles claros
+        # Headers limpios para que MELI no se confunda
         headers = {
             "Authorization": f"Bearer {token}", 
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
 
+        # Separamos el ID del producto y la variación
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
-            # Usamos un filtro para asegurar que el variation_id sea solo números
+            # Limpiamos el ID de variación para que sea solo número
             variation_id = int("".join(filter(str.isdigit, parts[1])))
             
             url_api = f"https://api.mercadolibre.com/items/{item_id}"
+            # Enviamos ÚNICAMENTE lo que MELI necesita para el stock
             payload = {
                 "variations": [
                     {"id": variation_id, "available_quantity": new_quantity}
@@ -324,28 +326,28 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
             payload = {"available_quantity": new_quantity}
 
+        # Enviamos la petición
         response = requests.put(url_api, headers=headers, json=payload)
 
-        # SI FALLA: Vamos a sacar el mensaje real de Mercado Libre
+        # Si falla, extraemos la razón detallada
         if response.status_code not in [200, 201]:
             error_data = response.json()
-            # MELI suele mandar el error real en una lista llamada 'cause'
-            error_detail = error_data.get('message', 'Error de validación')
+            error_msg = error_data.get('message', 'Error de validación')
+            # Si MELI nos da una causa específica (como lo de las fotos), la mostramos
             if 'cause' in error_data and error_data['cause']:
                 causa = error_data['cause'][0].get('message', '')
-                error_detail = f"{error_detail}: {causa}"
+                error_msg = f"{error_msg}: {causa}"
             
-            raise HTTPException(status_code=response.status_code, detail=error_detail)
+            raise HTTPException(status_code=response.status_code, detail=error_msg)
 
-        # Si todo bien, actualizamos local
+        # Si MELI aceptó, actualizamos nuestra base de datos local
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
         return {"status": "success"}
 
     except Exception as e:
         if conn: conn.rollback()
-        # Esto nos imprimirá en los logs de Render qué falló exactamente
-        print(f"Error actualizando stock: {str(e)}")
+        print(f"❌ Error en update_stock: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
