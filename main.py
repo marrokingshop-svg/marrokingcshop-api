@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Body, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 import os
 import psycopg2
 import requests
@@ -75,6 +76,8 @@ def startup_db():
 
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS item_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS variation_id TEXT;")
+    # Aseguramos que la columna de la foto exista desde que arranca el servidor
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
@@ -150,7 +153,7 @@ async def meli_callback(code: str = None):
     return {"status": "error", "detail": data}
 
 # =====================================================
-# SINCRONIZAR PRODUCTOS (ACTUALIZACIÓN REAL DE STOCK)
+# 2. SINCRONIZACIÓN CON MERCADO LIBRE
 # =====================================================
 @app.post("/meli/sync")
 def sync_meli_products(user=Depends(get_current_user)):
@@ -171,10 +174,9 @@ def sync_meli_products(user=Depends(get_current_user)):
         user_id = user_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 1. Obtener IDs (Agregamos params para evitar caché)
+        # 1. Obtener IDs
         items_ids = []
         url_search = f"https://api.mercadolibre.com/users/{user_id}/items/search"
-        # Traemos todos los estados posibles para no dejar ninguno fuera
         params = {"search_type": "scan", "limit": 100, "status": "active,paused,not_yet_active"}
         
         r_search = requests.get(url_search, headers=headers, params=params)
@@ -190,57 +192,54 @@ def sync_meli_products(user=Depends(get_current_user)):
             items_ids.extend(results)
             scroll_id = d_scroll.get("scroll_id")
 
+        # 3. Guardar o Actualizar Productos
         if items_ids:
-            # LIMPIEZA PARA RECONSTRUIR DESDE CERO
             cur.execute("DELETE FROM products")
+            
             count = 0
-
             for m_id in items_ids:
-                # TRUCO: Agregamos un timestamp aleatorio para forzar a MELI a darnos el dato real actual
                 ts = int(datetime.utcnow().timestamp())
                 detail_resp = requests.get(f"https://api.mercadolibre.com/items/{m_id}?ts={ts}", headers=headers)
+                
                 if detail_resp.status_code != 200: continue
                 item = detail_resp.json()
 
                 status_real = item.get("status", "active")
-                # El precio global
                 price = item.get("price") or 0
+                thumbnail_url = item.get("thumbnail", "") 
 
                 if item.get("variations"):
                     for var in item["variations"]:
-                        # IMPORTANTE: El stock de la secadora vendida está AQUÍ dentro
                         stock_var = var.get("available_quantity", 0)
                         attrs = " - ".join([a["value_name"] for a in var.get("attribute_combinations", [])])
                         name_var = f"{item['title']} ({attrs})"
                         meli_var_id = f"{m_id}-{var['id']}"
                         
                         cur.execute("""
-                            INSERT INTO products (name, price, stock, meli_id, status)
-                            VALUES (%s, %s, %s, %s, %s)
-                        """, (name_var, price, stock_var, meli_var_id, status_real))
+                            INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (name_var, price, stock_var, meli_var_id, status_real, thumbnail_url))
                         count += 1
                 else:
-                    # Si no tiene variaciones, el stock es el global
                     stock_global = item.get("available_quantity", 0)
                     cur.execute("""
-                        INSERT INTO products (name, price, stock, meli_id, status)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (item["title"], price, stock_global, m_id, status_real))
+                        INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (item["title"], price, stock_global, m_id, status_real, thumbnail_url))
                     count += 1
 
             conn.commit()
             return {"status": "success", "sincronizados": count}
-        
-        return {"status": "success", "message": "No hay productos"}
 
     except Exception as e:
         if conn: conn.rollback()
+        print(f"Error en sync: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
 
 # =====================================================
-# PRODUCTOS AGRUPADOS (PARA TU TABLA)
+# PRODUCTOS (LISTA PLANA PARA TU TABLA)
 # =====================================================
 @app.get("/products-grouped")
 def get_products_grouped():
@@ -248,7 +247,7 @@ def get_products_grouped():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT name, price, stock, meli_id, status
+        SELECT name, price, stock, meli_id, status, thumbnail
         FROM products
         ORDER BY name
     """)
@@ -256,33 +255,68 @@ def get_products_grouped():
     rows = cur.fetchall()
     conn.close()
 
-    grouped = {}
+    products = []
 
     for r in rows:
-        # --- ESTA ES LA CORRECCIÓN CRÍTICA ---
         if not r["meli_id"]: 
-            continue # Si el ID está vacío, ignora este producto y sigue con el otro
-        # -------------------------------------
+            continue
 
-        base_id = r["meli_id"].split("-")[0]
-        title = r["name"].split("(")[0].strip()
-
-        if base_id not in grouped:
-            grouped[base_id] = {
-                "title": title,
-                "status": r["status"],
-                "meli_item_id": base_id, # Agregamos esto para que se vea en la tabla
-                "variations": []
-            }
-
-        grouped[base_id]["variations"].append({
-            "meli_id": r["meli_id"],
-            "name": r["name"],
+        products.append({
+            "title": r["name"],
+            "status": r["status"],
+            "meli_item_id": r["meli_id"],
             "price": float(r["price"]) if r["price"] else 0,
-            "stock": r["stock"] or 0
+            "stock": r["stock"] if r["stock"] is not None else 0,
+            "thumbnail": r["thumbnail"] or "",
+            "variations": [] 
         })
 
-    return {"products": list(grouped.values())}
+    return {"products": products}
+
+# =====================================================
+# NUEVO: ACTUALIZAR STOCK EN MERCADO LIBRE Y LOCAL
+# =====================================================
+class StockUpdate(BaseModel):
+    new_stock: int
+
+@app.put("/meli/update_stock/{meli_id}")
+def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_current_user)):
+    new_quantity = stock_data.new_stock
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT value FROM credentials WHERE key='access_token'")
+        token_row = cur.fetchone()
+        if not token_row:
+            raise HTTPException(status_code=400, detail="No hay token")
+        token = token_row["value"]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Si tiene guion, es variante. Si no, es producto base.
+        if "-" in meli_id:
+            parts = meli_id.split("-")
+            url_api = f"https://api.mercadolibre.com/items/{parts[0]}/variations/{parts[1]}"
+        else:
+            url_api = f"https://api.mercadolibre.com/items/{meli_id}"
+
+        payload = {"available_quantity": new_quantity}
+        response = requests.put(url_api, headers=headers, json=payload)
+
+        if response.status_code not in [200, 201]:
+            raise HTTPException(status_code=response.status_code, detail="Error en MELI")
+
+        cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
+        conn.commit()
+
+        return {"status": "success"}
+
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
 
 # =====================================================
 # LOGIN
@@ -299,9 +333,7 @@ def login(username: str = Body(...), password: str = Body(...)):
     if not user:
         raise HTTPException(status_code=400, detail="Credenciales inválidas")
 
-    # --- CAMBIO CLAVE: VERIFICACIÓN DIRECTA ---
     try:
-        # Convertimos la contraseña y el hash a bytes para bcrypt
         password_bytes = password.encode('utf-8')
         hashed_password = user["password"].encode('utf-8')
 
@@ -309,10 +341,8 @@ def login(username: str = Body(...), password: str = Body(...)):
             raise HTTPException(status_code=400, detail="Credenciales inválidas")
     except Exception as e:
         print(f"Error en validación bcrypt: {e}")
-        # Si algo falla con bcrypt, intentamos el método viejo por si acaso
         if not pwd_context.verify(password, user["password"]):
             raise HTTPException(status_code=400, detail="Credenciales inválidas")
-    # ------------------------------------------
 
     token = create_access_token({
         "sub": user["username"],
@@ -320,3 +350,4 @@ def login(username: str = Body(...), password: str = Body(...)):
     })
     
     return {"access_token": token, "token_type": "bearer"}
+    
