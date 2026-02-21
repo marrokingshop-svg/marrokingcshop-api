@@ -298,13 +298,22 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         token_row = cur.fetchone()
         if not token_row:
             raise HTTPException(status_code=400, detail="No hay token vinculado")
+        
         token = token_row["value"]
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        # Agregamos "Accept" para que MELI nos responda con detalles claros
+        headers = {
+            "Authorization": f"Bearer {token}", 
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
 
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
-            variation_id = int(parts[1])
+            # Usamos un filtro para asegurar que el variation_id sea solo números
+            variation_id = int("".join(filter(str.isdigit, parts[1])))
+            
             url_api = f"https://api.mercadolibre.com/items/{item_id}"
             payload = {
                 "variations": [
@@ -317,17 +326,26 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
 
         response = requests.put(url_api, headers=headers, json=payload)
 
+        # SI FALLA: Vamos a sacar el mensaje real de Mercado Libre
         if response.status_code not in [200, 201]:
-            error_meli = response.json()
-            mensaje_error = error_meli.get('message', 'Error desconocido en MELI')
-            raise HTTPException(status_code=response.status_code, detail=mensaje_error)
+            error_data = response.json()
+            # MELI suele mandar el error real en una lista llamada 'cause'
+            error_detail = error_data.get('message', 'Error de validación')
+            if 'cause' in error_data and error_data['cause']:
+                causa = error_data['cause'][0].get('message', '')
+                error_detail = f"{error_detail}: {causa}"
+            
+            raise HTTPException(status_code=response.status_code, detail=error_detail)
 
+        # Si todo bien, actualizamos local
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
         return {"status": "success"}
 
     except Exception as e:
         if conn: conn.rollback()
+        # Esto nos imprimirá en los logs de Render qué falló exactamente
+        print(f"Error actualizando stock: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
