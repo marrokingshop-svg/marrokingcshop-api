@@ -25,7 +25,7 @@ pwd_context = CryptContext(
     deprecated="auto"
 )
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "MARROKING_SECRET_2024")
+SECRET_KEY = os.environ.get("SECRET_KEY", "MARROKING_SECRET_2025")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 security = HTTPBearer()
@@ -372,4 +372,3 @@ def login(username: str = Body(...), password: str = Body(...)):
     })
     
     return {"access_token": token, "token_type": "bearer"}
-    
