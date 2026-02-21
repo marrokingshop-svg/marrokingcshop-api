@@ -25,7 +25,7 @@ pwd_context = CryptContext(
     deprecated="auto"
 )
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "MARROKING_SECRET_2025")
+SECRET_KEY = os.environ.get("SECRET_KEY", "MARROKING_SECRET_2025_1")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 security = HTTPBearer()
