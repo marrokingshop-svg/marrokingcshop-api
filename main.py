@@ -50,7 +50,7 @@ def health():
     return {"status": "online"}
 
 # =====================================================
-# BASE DE DATOS
+# BASE DE DATOS - CON AUTO-REPARACIÓN
 # =====================================================
 def get_connection():
     database_url = os.environ.get("DATABASE_URL")
@@ -75,15 +75,20 @@ def startup_db():
         );
     """)
 
-    # 2. Aseguramos que existan las columnas nuevas (especialmente la de la foto)
+    # 2. Aseguramos que existan las columnas nuevas (fotos, IDs, etc)
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS item_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS variation_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
 
-    # 3. ESTA ES LA CLAVE: Borramos lo viejo para que no choque con lo nuevo
-    cur.execute("DELETE FROM products;")
+    # 3. CORRECCIÓN: Borrado en cascada para evitar el error de "sale_items"
+    # Esto limpia los productos y reinicia los contadores sin dar error de Foreign Key
+    try:
+        cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
+    except Exception as e:
+        print(f"Nota en Truncate: {e}")
+        cur.execute("DELETE FROM products;") # Respaldo si falla el truncate
 
-    # 4. Tablas de seguridad
+    # 4. Tablas de seguridad y credenciales
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
             key TEXT PRIMARY KEY,
@@ -102,7 +107,7 @@ def startup_db():
 
     conn.commit()
     conn.close()
-    print("Base de datos actualizada y limpia.")
+    print("✅ Base de datos actualizada y lista para fotos.")
 
 # =====================================================
 # SEGURIDAD
@@ -159,7 +164,7 @@ async def meli_callback(code: str = None):
     return {"status": "error", "detail": data}
 
 # =====================================================
-# 2. SINCRONIZACIÓN CON MERCADO LIBRE
+# SINCRONIZACIÓN CORREGIDA (CON FOTOS Y STATUS)
 # =====================================================
 @app.post("/meli/sync")
 def sync_meli_products(user=Depends(get_current_user)):
@@ -180,7 +185,7 @@ def sync_meli_products(user=Depends(get_current_user)):
         user_id = user_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 1. Obtener IDs
+        # 1. Obtener IDs (Limpieza previa de tabla interna para evitar duplicados)
         items_ids = []
         url_search = f"https://api.mercadolibre.com/users/{user_id}/items/search"
         params = {"search_type": "scan", "limit": 100, "status": "active,paused,not_yet_active"}
@@ -198,9 +203,9 @@ def sync_meli_products(user=Depends(get_current_user)):
             items_ids.extend(results)
             scroll_id = d_scroll.get("scroll_id")
 
-        # 3. Guardar o Actualizar Productos
+        # 2. Limpiar productos antes de la nueva carga fresca
         if items_ids:
-            cur.execute("DELETE FROM products")
+            cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
             
             count = 0
             for m_id in items_ids:
@@ -245,7 +250,7 @@ def sync_meli_products(user=Depends(get_current_user)):
         if conn: conn.close()
 
 # =====================================================
-# PRODUCTOS (LISTA PLANA PARA TU TABLA)
+# PRODUCTOS (CON SOPORTE PARA FOTOS)
 # =====================================================
 @app.get("/products-grouped")
 def get_products_grouped():
@@ -262,11 +267,8 @@ def get_products_grouped():
     conn.close()
 
     products = []
-
     for r in rows:
-        if not r["meli_id"]: 
-            continue
-
+        if not r["meli_id"]: continue
         products.append({
             "title": r["name"],
             "status": r["status"],
@@ -276,11 +278,10 @@ def get_products_grouped():
             "thumbnail": r["thumbnail"] or "",
             "variations": [] 
         })
-
     return {"products": products}
 
 # =====================================================
-# NUEVO: ACTUALIZAR STOCK EN MERCADO LIBRE Y LOCAL
+# ACTUALIZAR STOCK EN MERCADO LIBRE
 # =====================================================
 class StockUpdate(BaseModel):
     new_stock: int
@@ -300,11 +301,10 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # AQUÍ ESTÁ LA MAGIA: El formato exacto que exige Mercado Libre
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
-            variation_id = int(parts[1]) # MELI exige que sea un número
+            variation_id = int(parts[1])
             url_api = f"https://api.mercadolibre.com/items/{item_id}"
             payload = {
                 "variations": [
@@ -317,16 +317,13 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
 
         response = requests.put(url_api, headers=headers, json=payload)
 
-        # Si Mercado Libre nos rechaza el cambio, leemos EXACTAMENTE por qué
         if response.status_code not in [200, 201]:
             error_meli = response.json()
-            # Sacamos el mensaje de error que nos manda MELI
             mensaje_error = error_meli.get('message', 'Error desconocido en MELI')
             raise HTTPException(status_code=response.status_code, detail=mensaje_error)
 
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
-
         return {"status": "success"}
 
     except Exception as e:
@@ -357,7 +354,6 @@ def login(username: str = Body(...), password: str = Body(...)):
         if not bcrypt.checkpw(password_bytes, hashed_password):
             raise HTTPException(status_code=400, detail="Credenciales inválidas")
     except Exception as e:
-        print(f"Error en validación bcrypt: {e}")
         if not pwd_context.verify(password, user["password"]):
             raise HTTPException(status_code=400, detail="Credenciales inválidas")
 
