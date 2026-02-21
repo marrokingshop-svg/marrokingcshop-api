@@ -372,22 +372,4 @@ def login(username: str = Body(...), password: str = Body(...)):
     })
     
     return {"access_token": token, "token_type": "bearer"}
-
-    # =====================================================
-# 🚨 RUTA TEMPORAL PARA CAMBIAR CONTRASEÑA 🚨
-# =====================================================
-@app.get("/cambiar-pass-urgente/{usuario}/{nueva_contrasena}")
-def cambiar_pass_urgente(usuario: str, nueva_contrasena: str):
-    import bcrypt
-    conn = get_connection()
-    cur = conn.cursor()
     
-    # Encriptamos la nueva contraseña y la guardamos
-    password_bytes = nueva_contrasena.encode('utf-8')
-    hashed_password = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode('utf-8')
-    
-    cur.execute("UPDATE users SET password = %s WHERE username = %s", (hashed_password, usuario))
-    conn.commit()
-    conn.close()
-    
-    return {"mensaje": "¡Exito! Contrasena cambiada. AHORA BORRA ESTE CODIGO DE MAIN.PY"}
