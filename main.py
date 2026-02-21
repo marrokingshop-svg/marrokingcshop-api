@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Body, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, Body, HTTPException, Depends, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -31,7 +31,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 security = HTTPBearer()
 
 # =====================================================
-# CORS
+# CORS Y WEBSOCKETS (EL TÚNEL EN TIEMPO REAL 🚇)
 # =====================================================
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +40,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# Nuestro "Megáfono" para avisarle al Frontend
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                self.disconnect(connection)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/notifications")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Mantenemos el túnel abierto escuchando
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 @app.api_route("/{path_name:path}", methods=["OPTIONS"])
 async def handle_options(request: Request, path_name: str):
@@ -50,7 +82,7 @@ def health():
     return {"status": "online"}
 
 # =====================================================
-# BASE DE DATOS - CON AUTO-REPARACIÓN
+# BASE DE DATOS
 # =====================================================
 def get_connection():
     database_url = os.environ.get("DATABASE_URL")
@@ -96,7 +128,7 @@ def startup_db():
 
     conn.commit()
     conn.close()
-    print("✅ Base de datos actualizada y lista para Webhooks.")
+    print("✅ Base de datos actualizada y lista.")
 
 # =====================================================
 # SEGURIDAD
@@ -119,9 +151,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # =====================================================
 @app.api_route("/meli/notifications", methods=["POST", "GET"])
 async def meli_notifications(request: Request, background_tasks: BackgroundTasks):
-    """Recibe avisos de Mercado Libre y actualiza el stock automáticamente"""
     try:
-        # Si ML hace una prueba rápida (GET), le respondemos para que no marque error 405
         if request.method == "GET":
             return {"status": "ok"}
 
@@ -129,9 +159,19 @@ async def meli_notifications(request: Request, background_tasks: BackgroundTasks
         resource = data.get("resource") 
         topic = data.get("topic")
 
-        # Solo procesamos si es un cambio en producto o una venta
         if topic in ["items", "orders_v2", "orders"]:
             print(f"🔔 Notificación recibida: {topic} en {resource}")
+            
+            # 📢 ¡EL MEGÁFONO EN ACCIÓN! Le avisamos a tu index.html
+            meli_item_id = resource.split("/")[-1]
+            mensaje_alerta = f"¡Venta o cambio detectado en {meli_item_id}!" if "order" in topic else f"Stock actualizado en {meli_item_id}"
+            
+            await manager.broadcast({
+                "type": "notification",
+                "title": "🔔 Mercado Libre",
+                "message": mensaje_alerta
+            })
+
             background_tasks.add_task(sync_single_resource, resource)
         
         return {"status": "received"}
@@ -140,7 +180,6 @@ async def meli_notifications(request: Request, background_tasks: BackgroundTasks
         return {"status": "error"}
 
 def sync_single_resource(resource):
-    """Función de fondo que actualiza un solo producto en la BD"""
     conn = None
     try:
         meli_item_id = resource.split("/")[-1]
@@ -181,7 +220,7 @@ def sync_single_resource(resource):
                 """, (stock_global, price, status_real, thumbnail, meli_item_id))
             
             conn.commit()
-            print(f"✅ Sincronización automática exitosa para {meli_item_id}")
+            print(f"✅ Sincronización exitosa para {meli_item_id}")
 
     except Exception as e:
         print(f"❌ Error en sync_single_resource: {e}")
@@ -227,7 +266,7 @@ async def meli_callback(code: str = None):
     return {"status": "error", "detail": data}
 
 # =====================================================
-# SINCRONIZACIÓN MANUAL (BLINDADA) 🛡️
+# SINCRONIZACIÓN MANUAL
 # =====================================================
 @app.post("/meli/sync")
 def sync_meli_products(user=Depends(get_current_user)):
@@ -254,7 +293,6 @@ def sync_meli_products(user=Depends(get_current_user)):
         r_search = requests.get(url_search, headers=headers, params=params)
         
         if r_search.status_code != 200:
-            print(f"❌ Error ML: {r_search.text}")
             raise HTTPException(status_code=400, detail="El token expiró o falló la conexión con ML.")
 
         data_search = r_search.json()
@@ -276,10 +314,7 @@ def sync_meli_products(user=Depends(get_current_user)):
         productos_a_guardar = []
         for m_id in items_ids:
             detail_resp = requests.get(f"https://api.mercadolibre.com/items/{m_id}", headers=headers)
-            
-            if detail_resp.status_code != 200: 
-                print(f"⚠️ No se pudo obtener detalle de {m_id}")
-                continue 
+            if detail_resp.status_code != 200: continue 
                 
             item = detail_resp.json()
             status_real = item.get("status", "active")
@@ -292,7 +327,6 @@ def sync_meli_products(user=Depends(get_current_user)):
                     attrs = " - ".join([a["value_name"] for a in var.get("attribute_combinations", [])])
                     name_var = f"{item['title']} ({attrs})"
                     meli_var_id = f"{m_id}-{var['id']}"
-                    
                     productos_a_guardar.append((name_var, price, stock_var, meli_var_id, status_real, thumbnail_url))
             else:
                 stock_global = item.get("available_quantity", 0)
@@ -300,15 +334,12 @@ def sync_meli_products(user=Depends(get_current_user)):
 
         if productos_a_guardar:
             cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
-            
             for prod in productos_a_guardar:
                 cur.execute("""
                     INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
                     VALUES (%s, %s, %s, %s, %s, %s)
                 """, prod)
-            
             conn.commit()
-            print(f"✅ Sincronizados {len(productos_a_guardar)} productos.")
             return {"status": "success", "sincronizados": len(productos_a_guardar)}
         else:
             raise HTTPException(status_code=400, detail="No se pudo extraer el detalle de los productos.")
