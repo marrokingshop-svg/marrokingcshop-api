@@ -63,7 +63,6 @@ def startup_db():
     conn = get_connection()
     cur = conn.cursor()
 
-    # 1. Creamos la tabla si no existe
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
@@ -78,14 +77,6 @@ def startup_db():
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS item_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS variation_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
-
-    try:
-        # Nota: He comentado el truncate para que no borre todo cada vez que reinicies el servidor,
-        # solo lo hará cuando tú le des al botón de Sincronizar manualmente.
-        # cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
-        pass
-    except Exception as e:
-        print(f"Nota en Startup: {e}")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
@@ -126,18 +117,21 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # =====================================================
 # RECEPTOR DE NOTIFICACIONES AUTOMÁTICAS (WEBHOOK) 🚀
 # =====================================================
-@app.post("/meli/notifications")
+@app.api_route("/meli/notifications", methods=["POST", "GET"])
 async def meli_notifications(request: Request, background_tasks: BackgroundTasks):
     """Recibe avisos de Mercado Libre y actualiza el stock automáticamente"""
     try:
+        # Si ML hace una prueba rápida (GET), le respondemos para que no marque error 405
+        if request.method == "GET":
+            return {"status": "ok"}
+
         data = await request.json()
-        resource = data.get("resource") # Ejemplo: /items/MLM12345
+        resource = data.get("resource") 
         topic = data.get("topic")
 
         # Solo procesamos si es un cambio en producto o una venta
         if topic in ["items", "orders_v2", "orders"]:
             print(f"🔔 Notificación recibida: {topic} en {resource}")
-            # Ejecutamos la actualización en segundo plano
             background_tasks.add_task(sync_single_resource, resource)
         
         return {"status": "received"}
@@ -149,10 +143,7 @@ def sync_single_resource(resource):
     """Función de fondo que actualiza un solo producto en la BD"""
     conn = None
     try:
-        # Obtenemos el ID de Mercado Libre del recurso
-        # El recurso viene como '/items/MLM123', extraemos solo 'MLM123'
         meli_item_id = resource.split("/")[-1]
-        
         conn = get_connection()
         cur = conn.cursor()
 
@@ -163,7 +154,6 @@ def sync_single_resource(resource):
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # Consultamos el estado real en Mercado Libre
         ts = int(datetime.utcnow().timestamp())
         resp = requests.get(f"https://api.mercadolibre.com/items/{meli_item_id}?ts={ts}", headers=headers)
         
@@ -237,7 +227,7 @@ async def meli_callback(code: str = None):
     return {"status": "error", "detail": data}
 
 # =====================================================
-# SINCRONIZACIÓN MANUAL (COMPLETA)
+# SINCRONIZACIÓN MANUAL (BLINDADA) 🛡️
 # =====================================================
 @app.post("/meli/sync")
 def sync_meli_products(user=Depends(get_current_user)):
@@ -252,66 +242,76 @@ def sync_meli_products(user=Depends(get_current_user)):
         user_row = cur.fetchone()
 
         if not token_row or not user_row:
-            raise HTTPException(status_code=400, detail="Mercado Libre no vinculado")
+            raise HTTPException(status_code=400, detail="Mercado Libre no vinculado. Clic en 'Vincular Cuenta'.")
 
         token = token_row["value"]
         user_id = user_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        items_ids = []
         url_search = f"https://api.mercadolibre.com/users/{user_id}/items/search"
         params = {"search_type": "scan", "limit": 100, "status": "active,paused,not_yet_active"}
         
         r_search = requests.get(url_search, headers=headers, params=params)
+        
+        if r_search.status_code != 200:
+            print(f"❌ Error ML: {r_search.text}")
+            raise HTTPException(status_code=400, detail="El token expiró o falló la conexión con ML.")
+
         data_search = r_search.json()
-        items_ids.extend(data_search.get("results", []))
+        items_ids = data_search.get("results", [])
         scroll_id = data_search.get("scroll_id")
 
         while scroll_id:
             r_scroll = requests.get(url_search, headers=headers, params={"search_type": "scan", "scroll_id": scroll_id})
+            if r_scroll.status_code != 200: break
             d_scroll = r_scroll.json()
             results = d_scroll.get("results", [])
             if not results: break
             items_ids.extend(results)
             scroll_id = d_scroll.get("scroll_id")
 
-        if items_ids:
+        if not items_ids:
+            return {"status": "success", "sincronizados": 0, "message": "No hay productos en ML"}
+
+        productos_a_guardar = []
+        for m_id in items_ids:
+            detail_resp = requests.get(f"https://api.mercadolibre.com/items/{m_id}", headers=headers)
+            
+            if detail_resp.status_code != 200: 
+                print(f"⚠️ No se pudo obtener detalle de {m_id}")
+                continue 
+                
+            item = detail_resp.json()
+            status_real = item.get("status", "active")
+            price = item.get("price") or 0
+            thumbnail_url = item.get("thumbnail", "") 
+
+            if item.get("variations"):
+                for var in item["variations"]:
+                    stock_var = var.get("available_quantity", 0)
+                    attrs = " - ".join([a["value_name"] for a in var.get("attribute_combinations", [])])
+                    name_var = f"{item['title']} ({attrs})"
+                    meli_var_id = f"{m_id}-{var['id']}"
+                    
+                    productos_a_guardar.append((name_var, price, stock_var, meli_var_id, status_real, thumbnail_url))
+            else:
+                stock_global = item.get("available_quantity", 0)
+                productos_a_guardar.append((item["title"], price, stock_global, m_id, status_real, thumbnail_url))
+
+        if productos_a_guardar:
             cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
             
-            count = 0
-            for m_id in items_ids:
-                ts = int(datetime.utcnow().timestamp())
-                detail_resp = requests.get(f"https://api.mercadolibre.com/items/{m_id}?ts={ts}", headers=headers)
-                
-                if detail_resp.status_code != 200: continue
-                item = detail_resp.json()
-
-                status_real = item.get("status", "active")
-                price = item.get("price") or 0
-                thumbnail_url = item.get("thumbnail", "") 
-
-                if item.get("variations"):
-                    for var in item["variations"]:
-                        stock_var = var.get("available_quantity", 0)
-                        attrs = " - ".join([a["value_name"] for a in var.get("attribute_combinations", [])])
-                        name_var = f"{item['title']} ({attrs})"
-                        meli_var_id = f"{m_id}-{var['id']}"
-                        
-                        cur.execute("""
-                            INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                        """, (name_var, price, stock_var, meli_var_id, status_real, thumbnail_url))
-                        count += 1
-                else:
-                    stock_global = item.get("available_quantity", 0)
-                    cur.execute("""
-                        INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (item["title"], price, stock_global, m_id, status_real, thumbnail_url))
-                    count += 1
-
+            for prod in productos_a_guardar:
+                cur.execute("""
+                    INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, prod)
+            
             conn.commit()
-            return {"status": "success", "sincronizados": count}
+            print(f"✅ Sincronizados {len(productos_a_guardar)} productos.")
+            return {"status": "success", "sincronizados": len(productos_a_guardar)}
+        else:
+            raise HTTPException(status_code=400, detail="No se pudo extraer el detalle de los productos.")
 
     except Exception as e:
         if conn: conn.rollback()
