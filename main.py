@@ -250,10 +250,10 @@ def sync_meli_products(user=Depends(get_current_user)):
         if conn: conn.close()
 
 # =====================================================
-# PRODUCTOS (CON SOPORTE PARA FOTOS)
+# PRODUCTOS (CON SOPORTE PARA FOTOS) - AHORA SEGURO 🔒
 # =====================================================
 @app.get("/products-grouped")
-def get_products_grouped():
+def get_products_grouped(user = Depends(get_current_user)): # <--- ¡AQUÍ ESTÁ EL CANDADO!
     conn = get_connection()
     cur = conn.cursor()
 
