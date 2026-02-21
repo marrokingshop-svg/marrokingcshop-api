@@ -63,6 +63,7 @@ def startup_db():
     conn = get_connection()
     cur = conn.cursor()
 
+    # 1. Creamos la tabla si no existe
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
@@ -74,11 +75,15 @@ def startup_db():
         );
     """)
 
+    # 2. Aseguramos que existan las columnas nuevas (especialmente la de la foto)
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS item_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS variation_id TEXT;")
-    # Aseguramos que la columna de la foto exista desde que arranca el servidor
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
 
+    # 3. ESTA ES LA CLAVE: Borramos lo viejo para que no choque con lo nuevo
+    cur.execute("DELETE FROM products;")
+
+    # 4. Tablas de seguridad
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
             key TEXT PRIMARY KEY,
@@ -97,6 +102,7 @@ def startup_db():
 
     conn.commit()
     conn.close()
+    print("Base de datos actualizada y limpia.")
 
 # =====================================================
 # SEGURIDAD
