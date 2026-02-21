@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Body, HTTPException, Depends, Request
+from fastapi import FastAPI, Body, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -75,20 +75,18 @@ def startup_db():
         );
     """)
 
-    # 2. Aseguramos que existan las columnas nuevas (fotos, IDs, etc)
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS item_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS variation_id TEXT;")
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
 
-    # 3. CORRECCIÓN: Borrado en cascada para evitar el error de "sale_items"
-    # Esto limpia los productos y reinicia los contadores sin dar error de Foreign Key
     try:
-        cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
+        # Nota: He comentado el truncate para que no borre todo cada vez que reinicies el servidor,
+        # solo lo hará cuando tú le des al botón de Sincronizar manualmente.
+        # cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
+        pass
     except Exception as e:
-        print(f"Nota en Truncate: {e}")
-        cur.execute("DELETE FROM products;") # Respaldo si falla el truncate
+        print(f"Nota en Startup: {e}")
 
-    # 4. Tablas de seguridad y credenciales
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
             key TEXT PRIMARY KEY,
@@ -107,7 +105,7 @@ def startup_db():
 
     conn.commit()
     conn.close()
-    print("✅ Base de datos actualizada y lista para fotos.")
+    print("✅ Base de datos actualizada y lista para Webhooks.")
 
 # =====================================================
 # SEGURIDAD
@@ -124,6 +122,82 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         return payload
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido")
+
+# =====================================================
+# RECEPTOR DE NOTIFICACIONES AUTOMÁTICAS (WEBHOOK) 🚀
+# =====================================================
+@app.api_route("/meli/notifications", methods=["POST", "GET"])
+async def meli_notifications(request: Request, background_tasks: BackgroundTasks):
+    try:
+        # Si ML solo hace una prueba (GET), le decimos que estamos bien
+        if request.method == "GET":
+            return {"status": "ok", "message": "Receptor activo"}
+
+        data = await request.json()
+        resource = data.get("resource")
+        topic = data.get("topic")
+
+        if topic in ["items", "orders_v2", "orders"]:
+            print(f"🔔 Notificación recibida: {topic} en {resource}")
+            background_tasks.add_task(sync_single_resource, resource)
+        
+        return {"status": "received"}
+    except Exception as e:
+        print(f"❌ Error en receptor: {e}")
+        return {"status": "error"}
+
+def sync_single_resource(resource):
+    """Función de fondo que actualiza un solo producto en la BD"""
+    conn = None
+    try:
+        # Obtenemos el ID de Mercado Libre del recurso
+        # El recurso viene como '/items/MLM123', extraemos solo 'MLM123'
+        meli_item_id = resource.split("/")[-1]
+        
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT value FROM credentials WHERE key='access_token'")
+        token_row = cur.fetchone()
+        if not token_row: return
+
+        token = token_row["value"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Consultamos el estado real en Mercado Libre
+        ts = int(datetime.utcnow().timestamp())
+        resp = requests.get(f"https://api.mercadolibre.com/items/{meli_item_id}?ts={ts}", headers=headers)
+        
+        if resp.status_code == 200:
+            item = resp.json()
+            status_real = item.get("status", "active")
+            price = item.get("price") or 0
+            thumbnail = item.get("thumbnail", "")
+
+            if item.get("variations"):
+                for var in item["variations"]:
+                    stock_var = var.get("available_quantity", 0)
+                    meli_var_id = f"{meli_item_id}-{var['id']}"
+                    cur.execute("""
+                        UPDATE products 
+                        SET stock = %s, price = %s, status = %s, thumbnail = %s
+                        WHERE meli_id = %s
+                    """, (stock_var, price, status_real, thumbnail, meli_var_id))
+            else:
+                stock_global = item.get("available_quantity", 0)
+                cur.execute("""
+                    UPDATE products 
+                    SET stock = %s, price = %s, status = %s, thumbnail = %s
+                    WHERE meli_id = %s
+                """, (stock_global, price, status_real, thumbnail, meli_item_id))
+            
+            conn.commit()
+            print(f"✅ Sincronización automática exitosa para {meli_item_id}")
+
+    except Exception as e:
+        print(f"❌ Error en sync_single_resource: {e}")
+    finally:
+        if conn: conn.close()
 
 # =====================================================
 # AUTH MERCADO LIBRE
@@ -164,7 +238,7 @@ async def meli_callback(code: str = None):
     return {"status": "error", "detail": data}
 
 # =====================================================
-# SINCRONIZACIÓN CORREGIDA (CON FOTOS Y STATUS)
+# SINCRONIZACIÓN MANUAL (COMPLETA)
 # =====================================================
 @app.post("/meli/sync")
 def sync_meli_products(user=Depends(get_current_user)):
@@ -185,7 +259,6 @@ def sync_meli_products(user=Depends(get_current_user)):
         user_id = user_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 1. Obtener IDs (Limpieza previa de tabla interna para evitar duplicados)
         items_ids = []
         url_search = f"https://api.mercadolibre.com/users/{user_id}/items/search"
         params = {"search_type": "scan", "limit": 100, "status": "active,paused,not_yet_active"}
@@ -203,7 +276,6 @@ def sync_meli_products(user=Depends(get_current_user)):
             items_ids.extend(results)
             scroll_id = d_scroll.get("scroll_id")
 
-        # 2. Limpiar productos antes de la nueva carga fresca
         if items_ids:
             cur.execute("TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
             
@@ -244,16 +316,15 @@ def sync_meli_products(user=Depends(get_current_user)):
 
     except Exception as e:
         if conn: conn.rollback()
-        print(f"Error en sync: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
 
 # =====================================================
-# PRODUCTOS (CON SOPORTE PARA FOTOS) - AHORA SEGURO 🔒
+# PRODUCTOS
 # =====================================================
 @app.get("/products-grouped")
-def get_products_grouped(user = Depends(get_current_user)): # <--- ¡AQUÍ ESTÁ EL CANDADO!
+def get_products_grouped(user = Depends(get_current_user)):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -281,7 +352,7 @@ def get_products_grouped(user = Depends(get_current_user)): # <--- ¡AQUÍ ESTÁ
     return {"products": products}
 
 # =====================================================
-# ACTUALIZAR STOCK EN MERCADO LIBRE (VERSIÓN DIRECTA)
+# ACTUALIZAR STOCK
 # =====================================================
 class StockUpdate(BaseModel):
     new_stock: int
@@ -302,33 +373,24 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         token = token_row["value"]
         headers = {
             "Authorization": f"Bearer {token}", 
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Content-Type": "application/json"
         }
 
-        # --- AQUÍ ESTÁ EL CAMBIO CLAVE ---
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
             variation_id = int("".join(filter(str.isdigit, parts[1])))
-            
-            # URL DIRECTA A LA VARIANTE: Esto evita que MELI cuente las fotos de las otras tallas
             url_api = f"https://api.mercadolibre.com/items/{item_id}/variations/{variation_id}"
             payload = {"available_quantity": new_quantity}
         else:
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
             payload = {"available_quantity": new_quantity}
-        # ---------------------------------
 
         response = requests.put(url_api, headers=headers, json=payload)
 
         if response.status_code not in [200, 201]:
             error_data = response.json()
-            error_msg = error_data.get('message', 'Error de validación')
-            if 'cause' in error_data and error_data['cause']:
-                causa = error_data['cause'][0].get('message', '')
-                error_msg = f"{error_msg}: {causa}"
-            raise HTTPException(status_code=response.status_code, detail=error_msg)
+            raise HTTPException(status_code=response.status_code, detail=error_data.get('message'))
 
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
@@ -336,7 +398,6 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
 
     except Exception as e:
         if conn: conn.rollback()
-        print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
