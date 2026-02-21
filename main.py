@@ -300,23 +300,21 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
             raise HTTPException(status_code=400, detail="No hay token vinculado")
         
         token = token_row["value"]
-        
-        # Headers limpios para que MELI no se confunda
         headers = {
             "Authorization": f"Bearer {token}", 
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
 
-        # Separamos el ID del producto y la variación
+        # Separamos ID de item y variación
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
-            # Limpiamos el ID de variación para que sea solo número
+            # Limpiamos el ID de la talla para que sea solo número
             variation_id = int("".join(filter(str.isdigit, parts[1])))
             
             url_api = f"https://api.mercadolibre.com/items/{item_id}"
-            # Enviamos ÚNICAMENTE lo que MELI necesita para el stock
+            # MANDAMOS SOLO EL STOCK (Sin fotos, sin títulos, para evitar el error de las 12 fotos)
             payload = {
                 "variations": [
                     {"id": variation_id, "available_quantity": new_quantity}
@@ -326,28 +324,23 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
             payload = {"available_quantity": new_quantity}
 
-        # Enviamos la petición
         response = requests.put(url_api, headers=headers, json=payload)
 
-        # Si falla, extraemos la razón detallada
         if response.status_code not in [200, 201]:
             error_data = response.json()
             error_msg = error_data.get('message', 'Error de validación')
-            # Si MELI nos da una causa específica (como lo de las fotos), la mostramos
             if 'cause' in error_data and error_data['cause']:
                 causa = error_data['cause'][0].get('message', '')
                 error_msg = f"{error_msg}: {causa}"
-            
             raise HTTPException(status_code=response.status_code, detail=error_msg)
 
-        # Si MELI aceptó, actualizamos nuestra base de datos local
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
         return {"status": "success"}
 
     except Exception as e:
         if conn: conn.rollback()
-        print(f"❌ Error en update_stock: {str(e)}")
+        print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
