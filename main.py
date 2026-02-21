@@ -290,22 +290,33 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         cur.execute("SELECT value FROM credentials WHERE key='access_token'")
         token_row = cur.fetchone()
         if not token_row:
-            raise HTTPException(status_code=400, detail="No hay token")
+            raise HTTPException(status_code=400, detail="No hay token vinculado")
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # Si tiene guion, es variante. Si no, es producto base.
+        # AQUÍ ESTÁ LA MAGIA: El formato exacto que exige Mercado Libre
         if "-" in meli_id:
             parts = meli_id.split("-")
-            url_api = f"https://api.mercadolibre.com/items/{parts[0]}/variations/{parts[1]}"
+            item_id = parts[0]
+            variation_id = int(parts[1]) # MELI exige que sea un número
+            url_api = f"https://api.mercadolibre.com/items/{item_id}"
+            payload = {
+                "variations": [
+                    {"id": variation_id, "available_quantity": new_quantity}
+                ]
+            }
         else:
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
+            payload = {"available_quantity": new_quantity}
 
-        payload = {"available_quantity": new_quantity}
         response = requests.put(url_api, headers=headers, json=payload)
 
+        # Si Mercado Libre nos rechaza el cambio, leemos EXACTAMENTE por qué
         if response.status_code not in [200, 201]:
-            raise HTTPException(status_code=response.status_code, detail="Error en MELI")
+            error_meli = response.json()
+            # Sacamos el mensaje de error que nos manda MELI
+            mensaje_error = error_meli.get('message', 'Error desconocido en MELI')
+            raise HTTPException(status_code=response.status_code, detail=mensaje_error)
 
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
@@ -350,4 +361,3 @@ def login(username: str = Body(...), password: str = Body(...)):
     })
     
     return {"access_token": token, "token_type": "bearer"}
-    
