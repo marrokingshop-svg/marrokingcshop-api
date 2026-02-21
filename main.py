@@ -281,7 +281,7 @@ def get_products_grouped():
     return {"products": products}
 
 # =====================================================
-# ACTUALIZAR STOCK EN MERCADO LIBRE (VERSIÓN FINAL)
+# ACTUALIZAR STOCK EN MERCADO LIBRE (VERSIÓN DIRECTA)
 # =====================================================
 class StockUpdate(BaseModel):
     new_stock: int
@@ -306,23 +306,19 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
             "Accept": "application/json"
         }
 
-        # Separamos ID de item y variación
+        # --- AQUÍ ESTÁ EL CAMBIO CLAVE ---
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
-            # Limpiamos el ID de la talla para que sea solo número
             variation_id = int("".join(filter(str.isdigit, parts[1])))
             
-            url_api = f"https://api.mercadolibre.com/items/{item_id}"
-            # MANDAMOS SOLO EL STOCK (Sin fotos, sin títulos, para evitar el error de las 12 fotos)
-            payload = {
-                "variations": [
-                    {"id": variation_id, "available_quantity": new_quantity}
-                ]
-            }
+            # URL DIRECTA A LA VARIANTE: Esto evita que MELI cuente las fotos de las otras tallas
+            url_api = f"https://api.mercadolibre.com/items/{item_id}/variations/{variation_id}"
+            payload = {"available_quantity": new_quantity}
         else:
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
             payload = {"available_quantity": new_quantity}
+        # ---------------------------------
 
         response = requests.put(url_api, headers=headers, json=payload)
 
