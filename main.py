@@ -126,24 +126,23 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # =====================================================
 # RECEPTOR DE NOTIFICACIONES AUTOMÁTICAS (WEBHOOK) 🚀
 # =====================================================
-@app.api_route("/meli/notifications", methods=["POST", "GET"])
+@app.post("/meli/notifications")
 async def meli_notifications(request: Request, background_tasks: BackgroundTasks):
+    """Recibe avisos de Mercado Libre y actualiza el stock automáticamente"""
     try:
-        # Si ML solo hace una prueba (GET), le decimos que estamos bien
-        if request.method == "GET":
-            return {"status": "ok", "message": "Receptor activo"}
-
         data = await request.json()
-        resource = data.get("resource")
+        resource = data.get("resource") # Ejemplo: /items/MLM12345
         topic = data.get("topic")
 
+        # Solo procesamos si es un cambio en producto o una venta
         if topic in ["items", "orders_v2", "orders"]:
             print(f"🔔 Notificación recibida: {topic} en {resource}")
+            # Ejecutamos la actualización en segundo plano
             background_tasks.add_task(sync_single_resource, resource)
         
         return {"status": "received"}
     except Exception as e:
-        print(f"❌ Error en receptor: {e}")
+        print(f"❌ Error recibiendo notificación: {e}")
         return {"status": "error"}
 
 def sync_single_resource(resource):
