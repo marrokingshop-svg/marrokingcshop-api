@@ -6,6 +6,7 @@ import os
 import psycopg2
 import requests
 import bcrypt
+import time
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -180,19 +181,27 @@ async def meli_notifications(request: Request, background_tasks: BackgroundTasks
         return {"status": "error"}
 
 def sync_single_resource(resource):
+    # 🕒 Esperamos 10 segundos para que Meli actualice sus datos reales
+    time.sleep(10) 
+    
     conn = None
     try:
         meli_item_id = resource.split("/")[-1]
+        print(f"🔄 Iniciando sincronización de fondo para: {meli_item_id}")
+        
         conn = get_connection()
         cur = conn.cursor()
 
         cur.execute("SELECT value FROM credentials WHERE key='access_token'")
         token_row = cur.fetchone()
-        if not token_row: return
+        if not token_row: 
+            print("❌ No se encontró token en DB")
+            return
 
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
+        # Usamos el timestamp para saltar el caché de la API de Meli
         ts = int(datetime.utcnow().timestamp())
         resp = requests.get(f"https://api.mercadolibre.com/items/{meli_item_id}?ts={ts}", headers=headers)
         
@@ -220,11 +229,13 @@ def sync_single_resource(resource):
                 """, (stock_global, price, status_real, thumbnail, meli_item_id))
             
             conn.commit()
-            print(f"✅ Sincronización exitosa para {meli_item_id}")
+            print(f"✅ DB ACTUALIZADA para {meli_item_id}. Nuevo stock guardado.")
+        else:
+            print(f"⚠️ Meli respondió con error {resp.status_code}")
 
     except Exception as e:
-        print(f"❌ Error en sync_single_resource: {e}")
-    finally:
+        print(f"❌ Error crítico en sync_single_resource: {e}")
+    finally:s
         if conn: conn.close()
 
 # =====================================================
