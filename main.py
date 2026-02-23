@@ -229,14 +229,16 @@ def sync_single_resource(resource):
                 """, (stock_global, price, status_real, thumbnail, meli_item_id))
             
             conn.commit()
-            print(f"✅ DB ACTUALIZADA para {meli_item_id}. Nuevo stock guardado.")
+            print(f"✅ DB ACTUALIZADA para {meli_item_id}")
         else:
             print(f"⚠️ Meli respondió con error {resp.status_code}")
 
     except Exception as e:
         print(f"❌ Error crítico en sync_single_resource: {e}")
-    finally:s
-        if conn: conn.close()
+    finally:
+        if conn:
+            conn.close()
+            print("🔌 Conexión cerrada en tarea de fondo.")
 
 # =====================================================
 # AUTH MERCADO LIBRE
