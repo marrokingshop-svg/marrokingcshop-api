@@ -93,11 +93,15 @@ def get_connection():
         raise Exception("DATABASE_URL no configurada")
     return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
 
+# =====================================================
+# BASE DE DATOS (Versión Pro con Bóveda 🔐)
+# =====================================================
 @app.on_event("startup")
 def startup_db():
     conn = get_connection()
     cur = conn.cursor()
 
+    # Tabla de Productos unificada
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
@@ -105,14 +109,17 @@ def startup_db():
             price NUMERIC,
             stock INTEGER,
             meli_id TEXT UNIQUE,
-            status TEXT DEFAULT 'active'
+            status TEXT DEFAULT 'active',
+            item_id TEXT,
+            variation_id TEXT,
+            thumbnail TEXT
         );
     """)
 
-    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS item_id TEXT;")
-    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS variation_id TEXT;")
+    # Aseguramos columnas por si acaso la tabla ya existía
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
 
+    # Tabla de Credenciales Meli
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
             key TEXT PRIMARY KEY,
@@ -120,6 +127,7 @@ def startup_db():
         );
     """)
 
+    # Tabla de Usuarios del Sistema
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -129,9 +137,21 @@ def startup_db():
         );
     """)
 
+    # ✨ NUEVA TABLA: Bóveda de Claves de Trabajo
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS work_credentials (
+            id SERIAL PRIMARY KEY,
+            site_name TEXT,
+            email_user TEXT,
+            password_val TEXT,
+            category TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
     conn.commit()
     conn.close()
-    print("✅ Base de datos actualizada y lista.")
+    print("✅ Base de datos actualizada: ¡Bóveda de claves lista!")
 
 # =====================================================
 # SEGURIDAD
@@ -325,7 +345,10 @@ async def sync_meli_products(user=Depends(get_current_user)):
 # PRODUCTOS
 # =====================================================
 @app.get("/products-grouped")
-def get_products_grouped(user = Depends(get_current_user)):
+def get_products_grouped(response: Response, user = Depends(get_current_user)):
+    # 🚫 Le decimos al navegador: "NO guardes esto en caché"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    
     conn = get_connection()
     cur = conn.cursor()
 
@@ -353,11 +376,20 @@ def get_products_grouped(user = Depends(get_current_user)):
     return {"products": products}
 
 # =====================================================
-# ACTUALIZAR STOCK
+# MODELOS DE DATOS (Agrupados para evitar errores)
 # =====================================================
+class WorkCredential(BaseModel):
+    site_name: str
+    email_user: str
+    password_val: str
+    category: str
+
 class StockUpdate(BaseModel):
     new_stock: int
 
+# =====================================================
+# ACTUALIZAR STOCK (Tu código original sin cambios)
+# =====================================================
 @app.put("/meli/update_stock/{meli_id}")
 def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_current_user)):
     new_quantity = stock_data.new_stock
@@ -400,6 +432,49 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
     except Exception as e:
         if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+# =====================================================
+# RUTAS: BÓVEDA DE SEGURIDAD 🔐
+# =====================================================
+
+@app.get("/work-credentials")
+def get_work_credentials(user=Depends(get_current_user)):
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, site_name, email_user, password_val, category FROM work_credentials ORDER BY site_name ASC")
+        rows = cur.fetchall()
+        return {"credentials": rows}
+    finally:
+        if conn: conn.close()
+
+@app.post("/work-credentials")
+def add_work_credential(cred: WorkCredential, user=Depends(get_current_user)):
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO work_credentials (site_name, email_user, password_val, category)
+            VALUES (%s, %s, %s, %s)
+        """, (cred.site_name, cred.email_user, cred.password_val, cred.category))
+        conn.commit()
+        return {"status": "success"}
+    finally:
+        if conn: conn.close()
+
+@app.delete("/work-credentials/{cred_id}")
+def delete_work_credential(cred_id: int, user=Depends(get_current_user)):
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM work_credentials WHERE id = %s", (cred_id,))
+        conn.commit()
+        return {"status": "success"}
     finally:
         if conn: conn.close()
 
