@@ -6,6 +6,7 @@ import os
 import psycopg2
 import requests
 import bcrypt
+import asyncio
 import time
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
