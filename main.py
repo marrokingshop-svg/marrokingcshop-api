@@ -9,10 +9,12 @@ import requests
 import bcrypt
 import asyncio
 import time
+import json
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
+
 
 app = FastAPI(title="Marrokingcshop System Pro")
 
@@ -44,7 +46,6 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# Nuestro "Megáfono" para avisarle al Frontend
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -71,7 +72,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Mantenemos el túnel abierto escuchando
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -94,14 +94,54 @@ def get_connection():
     return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
 
 # =====================================================
-# BASE DE DATOS (Versión Pro con Bóveda 🔐)
+# AUTOMATIZACIÓN DE TOKEN (MEJORA PRO 🔐)
+# =====================================================
+def refresh_meli_token_db():
+    """Refresca el token usando la base de datos para autonomía total"""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT value FROM credentials WHERE key='refresh_token'")
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        refresh_token = row["value"]
+        url = "https://api.mercadolibre.com/oauth/token"
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": MELI_CLIENT_ID,
+            "client_secret": MELI_CLIENT_SECRET,
+            "refresh_token": refresh_token
+        }
+        
+        resp = requests.post(url, data=payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Guardamos el nuevo access y el nuevo refresh
+            cur.execute("""
+                INSERT INTO credentials (key, value)
+                VALUES ('access_token', %s), ('refresh_token', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (data["access_token"], data["refresh_token"]))
+            conn.commit()
+            print("✅ Token de MeLi refrescado automáticamente en DB")
+            return data["access_token"]
+        return None
+    except Exception as e:
+        print(f"❌ Error refrescando token: {e}")
+        return None
+    finally:
+        conn.close()
+
+# =====================================================
+# INICIALIZACIÓN DB
 # =====================================================
 @app.on_event("startup")
 def startup_db():
     conn = get_connection()
     cur = conn.cursor()
 
-    # Tabla de Productos unificada
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
@@ -116,10 +156,8 @@ def startup_db():
         );
     """)
 
-    # Aseguramos columnas por si acaso la tabla ya existía
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS thumbnail TEXT;")
 
-    # Tabla de Credenciales Meli
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credentials (
             key TEXT PRIMARY KEY,
@@ -127,7 +165,6 @@ def startup_db():
         );
     """)
 
-    # Tabla de Usuarios del Sistema
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -137,7 +174,6 @@ def startup_db():
         );
     """)
 
-    # ✨ NUEVA TABLA: Bóveda de Claves de Trabajo
     cur.execute("""
         CREATE TABLE IF NOT EXISTS work_credentials (
             id SERIAL PRIMARY KEY,
@@ -151,7 +187,7 @@ def startup_db():
 
     conn.commit()
     conn.close()
-    print("✅ Base de datos actualizada: ¡Bóveda de claves lista!")
+    print("✅ Base de datos Marroking System Pro Lista")
 
 # =====================================================
 # SEGURIDAD
@@ -170,7 +206,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Token inválido")
 
 # =====================================================
-# RECEPTOR DE NOTIFICACIONES AUTOMÁTICAS (WEBHOOK) 🚀
+# RECEPTOR DE NOTIFICACIONES (WEBHOOK)
 # =====================================================
 @app.api_route("/meli/notifications", methods=["POST", "GET"])
 async def meli_notifications(request: Request, background_tasks: BackgroundTasks):
@@ -183,11 +219,10 @@ async def meli_notifications(request: Request, background_tasks: BackgroundTasks
         topic = data.get("topic")
 
         if topic in ["items", "orders_v2", "orders"]:
-            print(f"🔔 Notificación recibida: {topic} en {resource}")
+            print(f"🔔 Notificación: {topic} en {resource}")
             
-            # 📢 ¡EL MEGÁFONO EN ACCIÓN! Le avisamos a tu index.html
             meli_item_id = resource.split("/")[-1]
-            mensaje_alerta = f"¡Venta o cambio detectado en {meli_item_id}!" if "order" in topic else f"Stock actualizado en {meli_item_id}"
+            mensaje_alerta = f"Venta detectada en {meli_item_id}" if "order" in topic else f"Cambio en {meli_item_id}"
             
             await manager.broadcast({
                 "type": "notification",
@@ -199,18 +234,15 @@ async def meli_notifications(request: Request, background_tasks: BackgroundTasks
         
         return {"status": "received"}
     except Exception as e:
-        print(f"❌ Error recibiendo notificación: {e}")
+        print(f"❌ Error webhook: {e}")
         return {"status": "error"}
 
 async def sync_single_resource(resource):
-    # 🕒 Espera inteligente (no bloquea el servidor)
     await asyncio.sleep(10) 
     
     conn = None
     try:
         meli_item_id = resource.split("/")[-1]
-        print(f"🔄 Sincronizando: {meli_item_id}")
-        
         conn = get_connection()
         cur = conn.cursor()
 
@@ -220,12 +252,17 @@ async def sync_single_resource(resource):
 
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
-
-        # Pedimos con timestamp para evitar datos viejos
-        ts = int(datetime.utcnow().timestamp())
-        url = f"https://api.mercadolibre.com/items/{meli_item_id}?ts={ts}"
+        url = f"https://api.mercadolibre.com/items/{meli_item_id}"
+        
         resp = requests.get(url, headers=headers)
         
+        # Auto-refresco si falla en segundo plano
+        if resp.status_code == 401:
+            nuevo_token = refresh_meli_token_db()
+            if nuevo_token:
+                headers["Authorization"] = f"Bearer {nuevo_token}"
+                resp = requests.get(url, headers=headers)
+
         if resp.status_code == 200:
             item = resp.json()
             price = item.get("price", 0)
@@ -248,23 +285,20 @@ async def sync_single_resource(resource):
                 """, (stock_global, price, status_real, thumbnail, meli_item_id))
             
             conn.commit()
-            print(f"✅ DB Sincronizada para {meli_item_id}")
-            
-            # Avisamos al frontend que ya puede recargar
+            print(f"✅ Sincronizado: {meli_item_id}")
             await manager.broadcast({"type": "sync_complete"})
             
     except Exception as e:
-        print(f"❌ Error en sincronización: {e}")
+        print(f"❌ Error sync: {e}")
     finally:
         if conn: conn.close()
 
 # =====================================================
-# AUTH MERCADO LIBRE
+# AUTH MERCADO LIBRE (CALLBACK MEJORADO)
 # =====================================================
 @app.get("/auth/callback")
 async def meli_callback(code: str = None):
-    if not code:
-        return {"status": "error", "message": "Falta code"}
+    if not code: return {"status": "error"}
 
     url = "https://api.mercadolibre.com/oauth/token"
     payload = {
@@ -281,103 +315,80 @@ async def meli_callback(code: str = None):
     if "access_token" in data:
         conn = get_connection()
         cur = conn.cursor()
-
+        # Guardamos TODO: access, user_id y refresh_token
         cur.execute("""
             INSERT INTO credentials (key, value)
-            VALUES ('access_token', %s), ('user_id', %s)
-            ON CONFLICT (key)
-            DO UPDATE SET value = EXCLUDED.value
-        """, (data["access_token"], str(data["user_id"])))
-
+            VALUES ('access_token', %s), ('user_id', %s), ('refresh_token', %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (data["access_token"], str(data["user_id"]), data["refresh_token"]))
         conn.commit()
         conn.close()
-
-        return {"status": "success", "message": "Conectado a Mercado Libre"}
-
+        return {"status": "success", "message": "Vinculación Exitosa"}
     return {"status": "error", "detail": data}
 
 # =====================================================
-# SINCRONIZACIÓN MANUAL
+# ACTUALIZAR STOCK (CON REINTENTO AUTOMÁTICO 🛡️)
 # =====================================================
-@app.post("/meli/sync")
-async def sync_meli_products(user=Depends(get_current_user)):
-    conn = None
+@app.put("/meli/update_stock/{meli_id}")
+def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_current_user)):
+    new_quantity = stock_data.new_stock
+    conn = get_connection()
+    cur = conn.cursor()
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
         cur.execute("SELECT value FROM credentials WHERE key='access_token'")
-        t_row = cur.fetchone()
-        cur.execute("SELECT value FROM credentials WHERE key='user_id'")
-        u_row = cur.fetchone()
-
-        if not t_row: raise HTTPException(status_code=400, detail="Vincule su cuenta de ML primero.")
-
-        token = t_row["value"]
-        user_id = u_row["value"]
-        headers = {"Authorization": f"Bearer {token}"}
-
-        # 1. Buscamos IDs
-        r = requests.get(f"https://api.mercadolibre.com/users/{user_id}/items/search", headers=headers, params={"limit": 100})
-        ids = r.json().get("results", [])
-
-        if not ids: return {"status": "success", "sincronizados": 0}
-
-        # 2. Obtenemos detalles y guardamos
-        count = 0
-        for m_id in ids:
-            det = requests.get(f"https://api.mercadolibre.com/items/{m_id}", headers=headers).json()
-            # ... (Aquí va tu lógica de variaciones que ya tienes) ...
-            # Pero asegúrate de usar INSERT ... ON CONFLICT en lugar de TRUNCATE
-            # para no borrar todo si algo falla.
-            count += 1
+        token_row = cur.fetchone()
+        if not token_row: raise HTTPException(status_code=400, detail="Vincule MeLi")
         
+        token = token_row["value"]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Lógica de URL (Variación o Item)
+        if "-" in meli_id:
+            parts = meli_id.split("-")
+            item_id = parts[0]
+            var_id = int("".join(filter(str.isdigit, parts[1])))
+            url_api = f"https://api.mercadolibre.com/items/{item_id}/variations/{var_id}"
+        else:
+            url_api = f"https://api.mercadolibre.com/items/{meli_id}"
+        
+        payload = {"available_quantity": new_quantity}
+        
+        # Intento 1
+        response = requests.put(url_api, headers=headers, json=payload)
+
+        # 🔄 SI EL TOKEN MURIÓ, REFRESCAMOS Y REINTENTAMOS SOLITO
+        if response.status_code == 401:
+            print("⚠️ Token vencido. Intentando autorefresco...")
+            nuevo_token = refresh_meli_token_db()
+            if nuevo_token:
+                headers["Authorization"] = f"Bearer {nuevo_token}"
+                response = requests.put(url_api, headers=headers, json=payload)
+
+        if response.status_code not in [200, 201]:
+            raise HTTPException(status_code=response.status_code, detail=response.json().get('message'))
+
+        cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
-        return {"status": "success", "sincronizados": count}
-    except Exception as e:
-        if conn: conn.rollback()
-        print(f"❌ Error Manual: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "success"}
     finally:
-        if conn: conn.close()
+        conn.close()
 
 # =====================================================
-# PRODUCTOS
+# PRODUCTOS Y LOGIN (ESTRUCTURA ORIGINAL)
 # =====================================================
 @app.get("/products-grouped")
 def get_products_grouped(response: Response, user = Depends(get_current_user)):
-    # 🚫 Le decimos al navegador: "NO guardes esto en caché"
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
-        SELECT name, price, stock, meli_id, status, thumbnail
-        FROM products
-        ORDER BY name
-    """)
-
+    cur.execute("SELECT name, price, stock, meli_id, status, thumbnail FROM products ORDER BY name")
     rows = cur.fetchall()
     conn.close()
-
-    products = []
-    for r in rows:
-        if not r["meli_id"]: continue
-        products.append({
-            "title": r["name"],
-            "status": r["status"],
-            "meli_item_id": r["meli_id"],
-            "price": float(r["price"]) if r["price"] else 0,
-            "stock": r["stock"] if r["stock"] is not None else 0,
-            "thumbnail": r["thumbnail"] or "",
-            "variations": [] 
-        })
+    products = [{"title": r["name"], "status": r["status"], "meli_item_id": r["meli_id"], 
+                "price": float(r["price"]), "stock": r["stock"], "thumbnail": r["thumbnail"], "variations": []} 
+               for r in rows if r["meli_id"]]
     return {"products": products}
 
-# =====================================================
-# MODELOS DE DATOS (Agrupados para evitar errores)
-# =====================================================
 class WorkCredential(BaseModel):
     site_name: str
     email_user: str
@@ -387,125 +398,34 @@ class WorkCredential(BaseModel):
 class StockUpdate(BaseModel):
     new_stock: int
 
-# =====================================================
-# ACTUALIZAR STOCK (Tu código original sin cambios)
-# =====================================================
-@app.put("/meli/update_stock/{meli_id}")
-def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_current_user)):
-    new_quantity = stock_data.new_stock
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        cur.execute("SELECT value FROM credentials WHERE key='access_token'")
-        token_row = cur.fetchone()
-        if not token_row:
-            raise HTTPException(status_code=400, detail="No hay token vinculado")
-        
-        token = token_row["value"]
-        headers = {
-            "Authorization": f"Bearer {token}", 
-            "Content-Type": "application/json"
-        }
-
-        if "-" in meli_id:
-            parts = meli_id.split("-")
-            item_id = parts[0]
-            variation_id = int("".join(filter(str.isdigit, parts[1])))
-            url_api = f"https://api.mercadolibre.com/items/{item_id}/variations/{variation_id}"
-            payload = {"available_quantity": new_quantity}
-        else:
-            url_api = f"https://api.mercadolibre.com/items/{meli_id}"
-            payload = {"available_quantity": new_quantity}
-
-        response = requests.put(url_api, headers=headers, json=payload)
-
-        if response.status_code not in [200, 201]:
-            error_data = response.json()
-            raise HTTPException(status_code=response.status_code, detail=error_data.get('message'))
-
-        cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
-        conn.commit()
-        return {"status": "success"}
-
-    except Exception as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
-
-# =====================================================
-# RUTAS: BÓVEDA DE SEGURIDAD 🔐
-# =====================================================
-
 @app.get("/work-credentials")
 def get_work_credentials(user=Depends(get_current_user)):
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, site_name, email_user, password_val, category FROM work_credentials ORDER BY site_name ASC")
-        rows = cur.fetchall()
-        return {"credentials": rows}
-    finally:
-        if conn: conn.close()
+    conn = get_connection(); cur = conn.cursor()
+    cur.execute("SELECT id, site_name, email_user, password_val, category FROM work_credentials ORDER BY site_name ASC")
+    rows = cur.fetchall(); conn.close()
+    return {"credentials": rows}
 
 @app.post("/work-credentials")
 def add_work_credential(cred: WorkCredential, user=Depends(get_current_user)):
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO work_credentials (site_name, email_user, password_val, category)
-            VALUES (%s, %s, %s, %s)
-        """, (cred.site_name, cred.email_user, cred.password_val, cred.category))
-        conn.commit()
-        return {"status": "success"}
-    finally:
-        if conn: conn.close()
+    conn = get_connection(); cur = conn.cursor()
+    cur.execute("INSERT INTO work_credentials (site_name, email_user, password_val, category) VALUES (%s, %s, %s, %s)", 
+                (cred.site_name, cred.email_user, cred.password_val, cred.category))
+    conn.commit(); conn.close()
+    return {"status": "success"}
 
 @app.delete("/work-credentials/{cred_id}")
 def delete_work_credential(cred_id: int, user=Depends(get_current_user)):
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM work_credentials WHERE id = %s", (cred_id,))
-        conn.commit()
-        return {"status": "success"}
-    finally:
-        if conn: conn.close()
+    conn = get_connection(); cur = conn.cursor()
+    cur.execute("DELETE FROM work_credentials WHERE id = %s", (cred_id,))
+    conn.commit(); conn.close()
+    return {"status": "success"}
 
-# =====================================================
-# LOGIN
-# =====================================================
 @app.post("/login")
 def login(username: str = Body(...), password: str = Body(...)):
-    conn = get_connection()
-    cur = conn.cursor()
-
+    conn = get_connection(); cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE username=%s", (username,))
-    user = cur.fetchone()
-    conn.close()
-
-    if not user:
-        raise HTTPException(status_code=400, detail="Credenciales inválidas")
-
-    try:
-        password_bytes = password.encode('utf-8')
-        hashed_password = user["password"].encode('utf-8')
-
-        if not bcrypt.checkpw(password_bytes, hashed_password):
-            raise HTTPException(status_code=400, detail="Credenciales inválidas")
-    except Exception as e:
-        if not pwd_context.verify(password, user["password"]):
-            raise HTTPException(status_code=400, detail="Credenciales inválidas")
-
-    token = create_access_token({
-        "sub": user["username"],
-        "role": user["role"]
-    })
-    
+    user = cur.fetchone(); conn.close()
+    if not user or not bcrypt.checkpw(password.encode('utf-8'), user["password"].encode('utf-8')):
+        raise HTTPException(status_code=400, detail="Error")
+    token = create_access_token({"sub": user["username"], "role": user["role"]})
     return {"access_token": token, "token_type": "bearer"}
