@@ -356,23 +356,26 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         # Intento 1
         response = requests.put(url_api, headers=headers, json=payload)
 
-        # 🔄 SI EL TOKEN MURIÓ, REFRESCAMOS Y REINTENTAMOS SOLITO
-        if response.status_code == 401:
-            print("⚠️ Token vencido. Intentando autorefresco...")
-            nuevo_token = refresh_meli_token_db()
-            if nuevo_token:
-                headers["Authorization"] = f"Bearer {nuevo_token}"
-                response = requests.put(url_api, headers=headers, json=payload)
-
         if response.status_code not in [200, 201]:
-            raise HTTPException(status_code=response.status_code, detail=response.json().get('message'))
+            # 🔍 CAPTURAMOS EL ERROR PARA LEERLO EN RENDER
+            error_data = response.json() 
+            print(f"❌ DETALLE DEL ERROR {response.status_code}: {json.dumps(error_data, indent=2)}")
+            
+            # Lanzamos la excepción con el mensaje que ya tenías
+            raise HTTPException(status_code=response.status_code, detail=error_data.get('message'))
 
+        # Si todo sale bien, actualizamos la base de datos
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
         return {"status": "success"}
+    except Exception as e:
+        if conn: conn.rollback()
+        # Si el error ya es una HTTPException, la dejamos pasar tal cual
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conn.close()
-
+        if conn: conn.close()
 # =====================================================
 # PRODUCTOS Y LOGIN (ESTRUCTURA ORIGINAL)
 # =====================================================
