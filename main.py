@@ -325,6 +325,79 @@ async def meli_callback(code: str = None):
         conn.close()
         return {"status": "success", "message": "Vinculación Exitosa"}
     return {"status": "error", "detail": data}
+# =====================================================
+# SINCRONIZACIÓN MANUAL (VUELVE A PONER ESTO 🔄)
+# =====================================================
+@app.post("/meli/sync")
+async def sync_meli_products(user=Depends(get_current_user)):
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT value FROM credentials WHERE key='access_token'")
+        t_row = cur.fetchone()
+        cur.execute("SELECT value FROM credentials WHERE key='user_id'")
+        u_row = cur.fetchone()
+
+        if not t_row: raise HTTPException(status_code=400, detail="Vincule su cuenta primero.")
+
+        token = t_row["value"]
+        user_id = u_row["value"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 1. Intentamos buscar tus productos en MeLi
+        r = requests.get(f"https://api.mercadolibre.com/users/{user_id}/items/search", headers=headers, params={"limit": 100})
+        
+        # 🔄 REINTENTO SI EL TOKEN ESTÁ VENCIDO
+        if r.status_code == 401:
+            nuevo_token = refresh_meli_token_db()
+            if nuevo_token:
+                headers["Authorization"] = f"Bearer {nuevo_token}"
+                r = requests.get(f"https://api.mercadolibre.com/users/{user_id}/items/search", headers=headers, params={"limit": 100})
+
+        ids = r.json().get("results", [])
+        if not ids: return {"status": "success", "sincronizados": 0}
+
+        # 2. Sincronizamos cada producto
+        count = 0
+        for m_id in ids:
+            det = requests.get(f"https://api.mercadolibre.com/items/{m_id}", headers=headers).json()
+            
+            name = det.get("title")
+            price = det.get("price")
+            status = det.get("status")
+            thumbnail = det.get("thumbnail")
+
+            if det.get("variations"):
+                for var in det["variations"]:
+                    v_id = f"{m_id}-{var['id']}"
+                    v_stock = var.get("available_quantity")
+                    cur.execute("""
+                        INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (meli_id) DO UPDATE SET 
+                            stock = EXCLUDED.stock, price = EXCLUDED.price, status = EXCLUDED.status, thumbnail = EXCLUDED.thumbnail
+                    """, (name, price, v_stock, v_id, status, thumbnail))
+            else:
+                stock = det.get("available_quantity")
+                cur.execute("""
+                    INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (meli_id) DO UPDATE SET 
+                        stock = EXCLUDED.stock, price = EXCLUDED.price, status = EXCLUDED.status, thumbnail = EXCLUDED.thumbnail
+                """, (name, price, stock, m_id, status, thumbnail))
+            count += 1
+        
+        conn.commit()
+        return {"status": "success", "sincronizados": count}
+        
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"❌ Error en Sync: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
 
 # =====================================================
 # ACTUALIZAR STOCK (CON REINTENTO AUTOMÁTICO Y LOGS PRO 🛡️)
