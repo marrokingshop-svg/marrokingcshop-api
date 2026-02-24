@@ -396,7 +396,7 @@ async def sync_meli_products(user=Depends(get_current_user)):
         if conn: conn.close()
 
 # =====================================================
-# ACTUALIZAR STOCK (LA VERDADERA SOLUCIÓN A LA ROPA 👕)
+# ACTUALIZAR STOCK (DIRECTO A VARIACIÓN PARA ESQUIVAR FOTOS 🎯)
 # =====================================================
 class StockUpdate(BaseModel):
     new_stock: int
@@ -404,7 +404,7 @@ class StockUpdate(BaseModel):
 @app.put("/meli/update_stock/{meli_id}")
 def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_current_user)):
     new_quantity = stock_data.new_stock
-    print(f"\n🚀 ACTUALIZANDO STOCK: {meli_id} -> {new_quantity}", flush=True)
+    print(f"\n🚀 ACTUALIZANDO STOCK DIRECTO: {meli_id} -> {new_quantity}", flush=True)
     
     conn = get_connection()
     cur = conn.cursor()
@@ -417,22 +417,15 @@ def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_cu
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # 🛠️ EL SECRETO PARA LA ROPA: La forma correcta de enviar las tallas
+        # 🛠️ EL SECRETO: Apuntar directo a la variación para no despertar al guardia de las fotos
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
             var_id = int("".join(filter(str.isdigit, parts[1])))
             
-            # Para prendas, MeLi pide que se haga desde el producto padre
-            url_api = f"https://api.mercadolibre.com/items/{item_id}"
-            payload = {
-                "variations": [
-                    {
-                        "id": var_id,
-                        "available_quantity": new_quantity
-                    }
-                ]
-            }
+            # ¡AQUÍ ESTÁ EL CAMBIO CLAVE! 
+            url_api = f"https://api.mercadolibre.com/items/{item_id}/variations/{var_id}"
+            payload = {"available_quantity": new_quantity}
         else:
             # Para perfumes o productos sin variaciones
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
