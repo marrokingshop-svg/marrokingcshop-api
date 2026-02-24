@@ -256,7 +256,6 @@ async def sync_single_resource(resource):
         
         resp = requests.get(url, headers=headers)
         
-        # Auto-refresco si falla en segundo plano
         if resp.status_code == 401:
             nuevo_token = refresh_meli_token_db()
             if nuevo_token:
@@ -285,7 +284,7 @@ async def sync_single_resource(resource):
                 """, (stock_global, price, status_real, thumbnail, meli_item_id))
             
             conn.commit()
-            print(f"✅ Sincronizado: {meli_item_id}")
+            print(f"✅ Sincronizado en DB: {meli_item_id}")
             await manager.broadcast({"type": "sync_complete"})
             
     except Exception as e:
@@ -315,7 +314,6 @@ async def meli_callback(code: str = None):
     if "access_token" in data:
         conn = get_connection()
         cur = conn.cursor()
-        # Guardamos TODO: access, user_id y refresh_token
         cur.execute("""
             INSERT INTO credentials (key, value)
             VALUES ('access_token', %s), ('user_id', %s), ('refresh_token', %s)
@@ -325,8 +323,9 @@ async def meli_callback(code: str = None):
         conn.close()
         return {"status": "success", "message": "Vinculación Exitosa"}
     return {"status": "error", "detail": data}
+
 # =====================================================
-# SINCRONIZACIÓN MANUAL (VUELVE A PONER ESTO 🔄)
+# SINCRONIZACIÓN MANUAL
 # =====================================================
 @app.post("/meli/sync")
 async def sync_meli_products(user=Depends(get_current_user)):
@@ -346,10 +345,8 @@ async def sync_meli_products(user=Depends(get_current_user)):
         user_id = u_row["value"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 1. Intentamos buscar tus productos en MeLi
         r = requests.get(f"https://api.mercadolibre.com/users/{user_id}/items/search", headers=headers, params={"limit": 100})
         
-        # 🔄 REINTENTO SI EL TOKEN ESTÁ VENCIDO
         if r.status_code == 401:
             nuevo_token = refresh_meli_token_db()
             if nuevo_token:
@@ -359,7 +356,6 @@ async def sync_meli_products(user=Depends(get_current_user)):
         ids = r.json().get("results", [])
         if not ids: return {"status": "success", "sincronizados": 0}
 
-        # 2. Sincronizamos cada producto
         count = 0
         for m_id in ids:
             det = requests.get(f"https://api.mercadolibre.com/items/{m_id}", headers=headers).json()
@@ -400,65 +396,85 @@ async def sync_meli_products(user=Depends(get_current_user)):
         if conn: conn.close()
 
 # =====================================================
-# ACTUALIZAR STOCK (CON REINTENTO AUTOMÁTICO Y LOGS PRO 🛡️)
+# ACTUALIZAR STOCK (LA VERDADERA SOLUCIÓN A LA ROPA 👕)
 # =====================================================
+class StockUpdate(BaseModel):
+    new_stock: int
+
 @app.put("/meli/update_stock/{meli_id}")
 def update_stock_meli(meli_id: str, stock_data: StockUpdate, user=Depends(get_current_user)):
     new_quantity = stock_data.new_stock
+    print(f"\n🚀 ACTUALIZANDO STOCK: {meli_id} -> {new_quantity}", flush=True)
+    
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("SELECT value FROM credentials WHERE key='access_token'")
         token_row = cur.fetchone()
         if not token_row: 
-            raise HTTPException(status_code=400, detail="Vincule MeLi")
+            raise HTTPException(status_code=400, detail="Vincule MeLi primero")
         
         token = token_row["value"]
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # Lógica de URL (Variación o Item)
+        # 🛠️ EL SECRETO PARA LA ROPA: La forma correcta de enviar las tallas
         if "-" in meli_id:
             parts = meli_id.split("-")
             item_id = parts[0]
             var_id = int("".join(filter(str.isdigit, parts[1])))
-            url_api = f"https://api.mercadolibre.com/items/{item_id}/variations/{var_id}"
+            
+            # Para prendas, MeLi pide que se haga desde el producto padre
+            url_api = f"https://api.mercadolibre.com/items/{item_id}"
+            payload = {
+                "variations": [
+                    {
+                        "id": var_id,
+                        "available_quantity": new_quantity
+                    }
+                ]
+            }
         else:
+            # Para perfumes o productos sin variaciones
             url_api = f"https://api.mercadolibre.com/items/{meli_id}"
+            payload = {"available_quantity": new_quantity}
         
-        payload = {"available_quantity": new_quantity}
-        
-        # Intento 1
+        # Enviamos la petición
         response = requests.put(url_api, headers=headers, json=payload)
 
-        # 🔄 SI EL TOKEN MURIÓ (401), REFRESCAMOS Y REINTENTAMOS
+        # 🔄 REINTENTO SI EL TOKEN MURIÓ
         if response.status_code == 401:
             print("⚠️ Token vencido. Intentando autorefresco...", flush=True)
-            nuevo_token = refresh_meli_token_db() # Esta es la función que ya pusimos antes
+            nuevo_token = refresh_meli_token_db()
             if nuevo_token:
                 headers["Authorization"] = f"Bearer {nuevo_token}"
                 response = requests.put(url_api, headers=headers, json=payload)
 
-        # 🔍 SI DA OTRO ERROR (Como el 422), MOSTRAMOS EL SECRETO
+        # 🔍 SI FALLA, LANZAMOS EL LOG DETALLADO
         if response.status_code not in [200, 201]:
             error_data = response.json()
-            print(f"❌ DETALLE DEL ERROR {response.status_code}: {json.dumps(error_data, indent=2)}", flush=True)
+            print("\n" + "❌"*10 + " ERROR DE MERCADO LIBRE " + "❌"*10, flush=True)
+            print(f"CÓDIGO: {response.status_code}", flush=True)
+            print(f"RESPUESTA: {json.dumps(error_data, indent=2)}", flush=True)
+            print("❌"*30 + "\n", flush=True)
             raise HTTPException(status_code=response.status_code, detail=error_data.get('message'))
 
-        # Si todo sale bien, actualizamos tu base de datos local
+        # Si todo sale perfecto, guardamos en la base de datos de Render
         cur.execute("UPDATE products SET stock = %s WHERE meli_id = %s", (new_quantity, meli_id))
         conn.commit()
+        print(f"⭐ Stock actualizado exitosamente en Mercado Libre para {meli_id}", flush=True)
         return {"status": "success"}
 
     except Exception as e:
         if conn: conn.rollback()
         if isinstance(e, HTTPException):
             raise e
-        print(f"❌ Error inesperado: {str(e)}", flush=True)
+        print(f"💥 ERROR INESPERADO: {str(e)}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
+
 # =====================================================
-# PRODUCTOS Y LOGIN (ESTRUCTURA ORIGINAL)
+# PRODUCTOS Y LOGIN
 # =====================================================
 @app.get("/products-grouped")
 def get_products_grouped(response: Response, user = Depends(get_current_user)):
@@ -478,9 +494,6 @@ class WorkCredential(BaseModel):
     email_user: str
     password_val: str
     category: str
-
-class StockUpdate(BaseModel):
-    new_stock: int
 
 @app.get("/work-credentials")
 def get_work_credentials(user=Depends(get_current_user)):
