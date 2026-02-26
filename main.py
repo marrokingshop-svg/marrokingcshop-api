@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from fastapi import Response
+from typing import Optional
 import os
 import psycopg2
 import requests
@@ -182,6 +183,19 @@ def startup_db():
             password_val TEXT,
             category TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS supplier_orders (
+            id SERIAL PRIMARY KEY,
+            supplier_name TEXT NOT NULL,
+            order_number TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'CONFIRMADA',
+            tracking_number TEXT,
+            total_amount NUMERIC,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
 
@@ -519,3 +533,59 @@ def login(username: str = Body(...), password: str = Body(...)):
         raise HTTPException(status_code=400, detail="Error")
     token = create_access_token({"sub": user["username"], "role": user["role"]})
     return {"access_token": token, "token_type": "bearer"}
+
+    # =====================================================
+# RECEPCIÓN DE ÓRDENES DE PROVEEDORES (WEBHOOKS)
+# =====================================================
+
+# 1. AQUÍ PEGAS LA CLASE
+class SupplierOrderCreate(BaseModel):
+    supplier_name: str
+    order_number: str
+    status: str
+    tracking_number: Optional[str] = None
+    total_amount: Optional[float] = None
+
+
+@app.post("/api/webhooks/supplier-orders/")
+def receive_supplier_order(order_in: SupplierOrderCreate):
+    conn = get_connection()  
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT id FROM supplier_orders 
+            WHERE order_number = %s AND supplier_name = %s
+        """, (order_in.order_number, order_in.supplier_name))
+        
+        existing_order = cur.fetchone()
+
+        if existing_order:
+            cur.execute("""
+                UPDATE supplier_orders 
+                SET status = %s, 
+                    tracking_number = COALESCE(%s, tracking_number), 
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s RETURNING *;
+            """, (order_in.status, order_in.tracking_number, existing_order['id']))
+            
+            updated_order = cur.fetchone()
+            conn.commit()
+            return {"status": "success", "message": "Orden actualizada", "data": updated_order}
+        
+        else:
+            cur.execute("""
+                INSERT INTO supplier_orders (supplier_name, order_number, status, tracking_number, total_amount)
+                VALUES (%s, %s, %s, %s, %s) RETURNING *;
+            """, (order_in.supplier_name, order_in.order_number, order_in.status, order_in.tracking_number, order_in.total_amount))
+            
+            new_order = cur.fetchone()
+            conn.commit()
+            return {"status": "success", "message": "Nueva orden registrada", "data": new_order}
+            
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error guardando orden: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
