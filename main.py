@@ -534,18 +534,17 @@ def login(username: str = Body(...), password: str = Body(...)):
     token = create_access_token({"sub": user["username"], "role": user["role"]})
     return {"access_token": token, "token_type": "bearer"}
 
-    # =====================================================
+# =====================================================
 # RECEPCIÓN DE ÓRDENES DE PROVEEDORES (WEBHOOKS)
 # =====================================================
 
-# 1. AQUÍ PEGAS LA CLASE
+# 1. AQUÍ PEGAS LA CLASE (Pegada al margen izquierdo)
 class SupplierOrderCreate(BaseModel):
     supplier_name: str
     order_number: str
     status: str
     tracking_number: Optional[str] = None
     total_amount: Optional[float] = None
-
 
 @app.post("/api/webhooks/supplier-orders/")
 def receive_supplier_order(order_in: SupplierOrderCreate):
@@ -589,3 +588,18 @@ def receive_supplier_order(order_in: SupplierOrderCreate):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+@app.get("/api/supplier-orders/")
+def get_supplier_orders(user=Depends(get_current_user)): 
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # Traemos todas las órdenes, ordenadas de la más reciente a la más vieja
+        cur.execute("SELECT * FROM supplier_orders ORDER BY created_at DESC")
+        orders = cur.fetchall()
+        return {"status": "success", "orders": orders}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
