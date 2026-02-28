@@ -278,7 +278,7 @@ async def sync_single_resource(resource):
 
         if resp.status_code == 200:
             item = resp.json()
-            name = item.get("title", "")  # 👈 ¡ESTO FALTABA!
+            name = item.get("title", "")  
             price = item.get("price", 0)
             status_real = item.get("status", "active")
             thumbnail = item.get("thumbnail", "")
@@ -287,25 +287,37 @@ async def sync_single_resource(resource):
                 for var in item["variations"]:
                     stock_var = var.get("available_quantity", 0)
                     meli_var_id = f"{meli_item_id}-{var['id']}"
+                    
+                    # 👇 AHORA ES UN INSERT CON REGLA DE ACTUALIZACIÓN 👇
                     cur.execute("""
-                        UPDATE products SET name = %s, stock = %s, price = %s, status = %s, thumbnail = %s 
-                        WHERE meli_id = %s
-                    """, (name, stock_var, price, status_real, thumbnail, meli_var_id)) # 👈 Faltaba agregar 'name' aquí
+                        INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (meli_id) DO UPDATE SET 
+                            name = EXCLUDED.name,
+                            stock = EXCLUDED.stock, 
+                            price = EXCLUDED.price, 
+                            status = EXCLUDED.status, 
+                            thumbnail = EXCLUDED.thumbnail
+                    """, (name, price, stock_var, meli_var_id, status_real, thumbnail))
             else:
                 stock_global = item.get("available_quantity", 0)
+                
+                # 👇 LO MISMO PARA PRODUCTOS SIN VARIACIONES 👇
                 cur.execute("""
-                    UPDATE products SET name = %s, stock = %s, price = %s, status = %s, thumbnail = %s 
-                    WHERE meli_id = %s
-                """, (name, stock_global, price, status_real, thumbnail, meli_item_id)) # 👈 Y aquí
+                    INSERT INTO products (name, price, stock, meli_id, status, thumbnail)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (meli_id) DO UPDATE SET 
+                        name = EXCLUDED.name,
+                        stock = EXCLUDED.stock, 
+                        price = EXCLUDED.price, 
+                        status = EXCLUDED.status, 
+                        thumbnail = EXCLUDED.thumbnail
+                """, (name, price, stock_global, meli_item_id, status_real, thumbnail))
             
             conn.commit()
-            print(f"✅ Sincronizado en DB: {meli_item_id}")
+            print(f"✅ Sincronizado en DB (Upsert): {meli_item_id}")
             await manager.broadcast({"type": "sync_complete"})
-            
-    except Exception as e:
-        print(f"❌ Error sync: {e}")
-    finally:
-        if conn: conn.close()
+
 
 # =====================================================
 # AUTH MERCADO LIBRE (CALLBACK MEJORADO)
