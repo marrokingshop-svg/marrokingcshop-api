@@ -278,6 +278,7 @@ async def sync_single_resource(resource):
 
         if resp.status_code == 200:
             item = resp.json()
+            name = item.get("title", "")  # 👈 ¡ESTO FALTABA!
             price = item.get("price", 0)
             status_real = item.get("status", "active")
             thumbnail = item.get("thumbnail", "")
@@ -287,15 +288,15 @@ async def sync_single_resource(resource):
                     stock_var = var.get("available_quantity", 0)
                     meli_var_id = f"{meli_item_id}-{var['id']}"
                     cur.execute("""
-                        UPDATE products SET stock = %s, price = %s, status = %s, thumbnail = %s 
+                        UPDATE products SET name = %s, stock = %s, price = %s, status = %s, thumbnail = %s 
                         WHERE meli_id = %s
-                    """, (stock_var, price, status_real, thumbnail, meli_var_id))
+                    """, (name, stock_var, price, status_real, thumbnail, meli_var_id)) # 👈 Faltaba agregar 'name' aquí
             else:
                 stock_global = item.get("available_quantity", 0)
                 cur.execute("""
-                    UPDATE products SET stock = %s, price = %s, status = %s, thumbnail = %s 
+                    UPDATE products SET name = %s, stock = %s, price = %s, status = %s, thumbnail = %s 
                     WHERE meli_id = %s
-                """, (stock_global, price, status_real, thumbnail, meli_item_id))
+                """, (name, stock_global, price, status_real, thumbnail, meli_item_id)) # 👈 Y aquí
             
             conn.commit()
             print(f"✅ Sincronizado en DB: {meli_item_id}")
