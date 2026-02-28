@@ -317,7 +317,11 @@ async def sync_single_resource(resource):
             conn.commit()
             print(f"✅ Sincronizado en DB (Upsert): {meli_item_id}")
             await manager.broadcast({"type": "sync_complete"})
-
+            
+    except Exception as e:
+        print(f"❌ Error sync: {e}")
+    finally:
+        if conn: conn.close()
 
 # =====================================================
 # AUTH MERCADO LIBRE (CALLBACK MEJORADO)
